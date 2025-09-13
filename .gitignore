@@ -1,13 +1,25 @@
-# Ignore audio uploads
+# Environment
+venv/
+.env
+
+# Audio uploads
 uploads/
+*.wav
+*.mp3
+*.m4a
 
-# Ignore SQLite database
+# Models
+models/vosk-model-small-en-us-0.15/
+*.pkl
+*.zip
+
+# Database
 *.db
+*.index
 
-# Ignore Python cache files
+# Python cache
 __pycache__/
 *.pyc
 
-# Ignore virtual environment
-venv/
-.env
+# Logs
+*.log
