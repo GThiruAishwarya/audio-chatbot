@@ -7,6 +7,7 @@ import pyttsx3
 import tempfile
 import json
 import librosa
+import zipfile
 from vosk import Model, KaldiRecognizer
 from pydub import AudioSegment
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -17,59 +18,82 @@ from audio_recorder_streamlit import audio_recorder
 # ===============================
 # CONFIGURATION
 # ===============================
-FFMPEG_BIN = r"C:\Users\gotte\Downloads\ffmpeg-8.0-essentials_build\ffmpeg-8.0-essentials_build\bin"
-os.environ["PATH"] += os.pathsep + FFMPEG_BIN
-AudioSegment.converter = os.path.join(FFMPEG_BIN, "ffmpeg.exe")
-AudioSegment.ffprobe = os.path.join(FFMPEG_BIN, "ffprobe.exe")
 
+# --- FFmpeg Setup ---
+# On Hugging Face, ffmpeg will be installed automatically using packages.txt
+# On local Windows machine, update FFMPEG_BIN path as needed
+FFMPEG_BIN = r"C:\Users\gotte\Downloads\ffmpeg-8.0-essentials_build\ffmpeg-8.0-essentials_build\bin"
+if os.path.exists(FFMPEG_BIN):
+    os.environ["PATH"] += os.pathsep + FFMPEG_BIN
+    AudioSegment.converter = os.path.join(FFMPEG_BIN, "ffmpeg.exe")
+    AudioSegment.ffprobe = os.path.join(FFMPEG_BIN, "ffprobe.exe")
+
+# --- Paths ---
 DB_PATH = "database.db"
 UPLOADS_DIR = "uploads"
-VOSK_MODEL_PATH = "models/vosk-model-small-en-us-0.15"
+VOSK_MODEL_DIR = "models/vosk-model-small-en-us-0.15"
+VOSK_MODEL_ZIP = "models/vosk-model-small-en-us-0.15.zip"
 
-# Ensure upload directory exists
+# Ensure uploads directory exists
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-# Load Vosk speech recognition model
-vosk_model = Model(VOSK_MODEL_PATH)
+# ===============================
+# VOSK MODEL HANDLING
+# ===============================
 
-# Globals for FAQ search
+# Automatically unzip Vosk model if only zip exists (e.g., on Hugging Face)
+if not os.path.exists(VOSK_MODEL_DIR):
+    if os.path.exists(VOSK_MODEL_ZIP):
+        with zipfile.ZipFile(VOSK_MODEL_ZIP, 'r') as zip_ref:
+            zip_ref.extractall("models")
+        print("✅ Vosk model extracted successfully!")
+    else:
+        raise FileNotFoundError("❌ Vosk model not found! Please include either the folder or the zip file in /models")
+
+# Load Vosk model
+vosk_model = Model(VOSK_MODEL_DIR)
+
+# ===============================
+# GLOBAL VARIABLES
+# ===============================
 vectorizer = TfidfVectorizer()
 faq_questions = []
 faq_answers = []
 faq_vectors = None
-
-# Globals for audio classification
 audio_features = []
 audio_labels = []
 
 # ===============================
-# Audio Feature Extraction
+# AUDIO FEATURE EXTRACTION
 # ===============================
 def extract_audio_features(file_path):
-    """Extract features like MFCC, spectral centroid, zero crossing rate, and RMS from audio."""
+    """Extract MFCC, spectral centroid, zero crossing rate, and RMS energy from audio."""
     y, sr = librosa.load(file_path, sr=None)
+    
+    # MFCC
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
     mfcc_mean = np.mean(mfcc, axis=1)
+    
+    # Spectral Centroid
     spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
     spectral_centroid_mean = np.mean(spectral_centroid)
+    
+    # Zero Crossing Rate
     zero_crossing_rate = librosa.feature.zero_crossing_rate(y)
     zero_crossing_rate_mean = np.mean(zero_crossing_rate)
+    
+    # RMS Energy
     rms = librosa.feature.rms(y=y)
     rms_mean = np.mean(rms)
 
-    feature_vector = np.hstack([
-        mfcc_mean,
-        spectral_centroid_mean,
-        zero_crossing_rate_mean,
-        rms_mean
-    ])
-    return feature_vector
+    # Combine features into one vector
+    return np.hstack([mfcc_mean, spectral_centroid_mean, zero_crossing_rate_mean, rms_mean])
 
 # ===============================
-# Database Helpers
+# DATABASE HELPERS
 # ===============================
 def load_faq_from_db():
-    """Load FAQ questions and answers from the database and vectorize them."""
+    """Load FAQ data from SQLite DB and vectorize questions."""
     global faq_questions, faq_answers, faq_vectors
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -81,17 +105,16 @@ def load_faq_from_db():
         if rows:
             faq_questions = [q for q, _ in rows]
             faq_answers = [a for _, a in rows]
-            try:
-                faq_vectors = vectorizer.fit_transform(faq_questions)
-            except ValueError:
-                st.warning("No FAQ questions found in the database. Please check init_db.py.")
-                faq_vectors = None
+            faq_vectors = vectorizer.fit_transform(faq_questions)
+        else:
+            st.warning("No FAQ questions found in the database.")
+            faq_vectors = None
     except sqlite3.Error as e:
         st.error(f"Database error: {e}")
         faq_vectors = None
 
 def load_audio_features_and_train():
-    """Load labeled audio data from DB, extract features, and train KNN."""
+    """Extract features for all audio files in DB and train KNN classifier."""
     global audio_features, audio_labels
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -102,7 +125,6 @@ def load_audio_features_and_train():
     audio_features.clear()
     audio_labels.clear()
 
-    # Extract features from each audio file
     for file_name, label in rows:
         file_path = os.path.join(UPLOADS_DIR, file_name)
         if os.path.exists(file_path):
@@ -113,11 +135,10 @@ def load_audio_features_and_train():
             except Exception as e:
                 st.warning(f"Failed to extract features from {file_name}: {e}")
         else:
-            st.warning(f"File missing: {file_name} (Expected at {file_path})")
+            st.warning(f"Missing file: {file_name}")
 
     if audio_features:
-        # Dynamically adjust n_neighbors
-        k_value = min(3, len(audio_features))
+        k_value = min(3, len(audio_features))  # Adjust neighbors dynamically
         st.session_state['knn_model'] = KNeighborsClassifier(n_neighbors=k_value)
         st.session_state['knn_model'].fit(audio_features, audio_labels)
         return True
@@ -125,17 +146,22 @@ def load_audio_features_and_train():
         st.session_state['knn_model'] = None
         return False
 
+# ===============================
+# AUDIO PREDICTION
+# ===============================
 def predict_audio_label(file_path):
-    """Predict the label of a new audio file using the trained KNN."""
+    """Predict label of a new audio sample using KNN."""
     knn_model = st.session_state.get('knn_model', None)
     if knn_model is None:
         return "Model not trained"
     features = extract_audio_features(file_path)
-    pred_label = knn_model.predict([features])[0]
-    return pred_label
+    return knn_model.predict([features])[0]
 
+# ===============================
+# FAQ SEARCH
+# ===============================
 def search_answer(query):
-    """Search for the most relevant FAQ answer using TF-IDF cosine similarity."""
+    """Search FAQ using TF-IDF and cosine similarity."""
     global faq_vectors
     if faq_vectors is None or not faq_questions:
         return "No data available."
@@ -145,20 +171,19 @@ def search_answer(query):
     query_vec = vectorizer.transform([query])
     sims = cosine_similarity(query_vec, faq_vectors)
     idx = np.argmax(sims)
-    max_sim = sims[0][idx]
-
-    if max_sim < 0.2:
+    if sims[0][idx] < 0.2:
         return "Sorry, I couldn't find a good match for your question."
     return faq_answers[idx]
 
 # ===============================
-# Audio Helpers
+# AUDIO PROCESSING
 # ===============================
 def transcribe_audio(file_path):
     """Convert speech in audio file to text using Vosk."""
     try:
         rec = KaldiRecognizer(vosk_model, 16000)
         audio = AudioSegment.from_file(file_path).set_frame_rate(16000).set_channels(1)
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
             audio.export(tmp_wav.name, format="wav")
             import wave
@@ -171,8 +196,7 @@ def transcribe_audio(file_path):
                 if rec.AcceptWaveform(data):
                     res = json.loads(rec.Result())
                     results.append(res.get("text", ""))
-            res = json.loads(rec.FinalResult())
-            results.append(res.get("text", ""))
+            results.append(json.loads(rec.FinalResult()).get("text", ""))
             wf.close()
         os.unlink(tmp_wav.name)
         return " ".join(results).strip()
@@ -181,18 +205,17 @@ def transcribe_audio(file_path):
         return ""
 
 def text_to_speech(text, filename=None):
-    """Convert text answer to speech and save as an audio file."""
+    """Convert text to speech and save as WAV file."""
     try:
         if filename is None:
             filename = os.path.join(UPLOADS_DIR, f"response_{uuid.uuid4()}.wav")
-
         engine = pyttsx3.init()
         engine.setProperty('rate', 180)
         engine.save_to_file(text, filename)
         engine.runAndWait()
         return filename
     except Exception as e:
-        st.error(f"Error during text-to-speech conversion: {e}")
+        st.error(f"Error during text-to-speech: {e}")
         return None
 
 # ===============================
@@ -202,11 +225,11 @@ st.set_page_config(page_title="Offline Audio Chatbot", layout="centered")
 st.title("🎤 Offline Audio Chatbot")
 st.markdown("---")
 
-# Load FAQs at startup
+# Load FAQ data on startup
 load_faq_from_db()
 
 # ===============================
-# Train Model Section
+# TRAINING SECTION
 # ===============================
 if st.button("🔄 Train Model with Audio Samples"):
     with st.spinner("Extracting features and training model..."):
@@ -214,13 +237,13 @@ if st.button("🔄 Train Model with Audio Samples"):
     if success:
         st.success("Training completed successfully!")
     else:
-        st.error("No audio samples found to train. Please upload labeled audio files.")
+        st.error("No audio samples found. Please upload labeled files.")
 
 # ===============================
-# Method 1: Upload Audio → Real-time Prediction
+# METHOD 1: UPLOAD AUDIO FILE
 # ===============================
 st.header("📂 Method 1: Upload Audio → Real-time Prediction")
-uploaded_file = st.file_uploader("Upload an audio file (.mp3, .wav, .m4a)", type=["mp3", "wav", "m4a"])
+uploaded_file = st.file_uploader("Upload audio (.mp3, .wav, .m4a)", type=["mp3", "wav", "m4a"])
 if uploaded_file:
     file_path = os.path.join(UPLOADS_DIR, uploaded_file.name)
     with open(file_path, "wb") as f:
@@ -248,12 +271,12 @@ if uploaded_file:
                 st.audio(audio_file, format="audio/wav")
 
 # ===============================
-# Method 2: Mic / Text → Direct Response
+# METHOD 2: RECORD OR TYPE
 # ===============================
 st.header("🎙 Method 2: Interaction (Mic / Text → Direct Response)")
 col1, col2 = st.columns(2)
 
-# ----------- Voice Recording Section -----------
+# Voice Recording
 with col1:
     st.subheader("🎤 Record Your Voice")
     audio_bytes = audio_recorder()
@@ -269,19 +292,12 @@ with col1:
         if st.button("🔍 Submit Recorded Audio"):
             knn_model = st.session_state.get('knn_model', None)
             if knn_model is None:
-                st.warning("⚠ Please train the model first before processing voice queries.")
+                st.warning("⚠ Please train the model first.")
             else:
                 with st.spinner("Processing your voice query..."):
-                    # 1. Transcribe audio
                     query_text = transcribe_audio(query_path)
-
-                    # 2. Predict label
                     pred_label = predict_audio_label(query_path)
-
-                    # 3. Find FAQ answer
                     answer = search_answer(query_text)
-
-                    # 4. Convert to speech
                     audio_file = text_to_speech(answer)
 
                 st.subheader("Response Section")
@@ -291,14 +307,14 @@ with col1:
                 if audio_file:
                     st.audio(audio_file, format="audio/wav")
 
-# ----------- Text Query Section -----------
+# Text Query
 with col2:
     st.subheader("⌨ Type Your Question")
     text_query = st.text_input("Enter your question:")
 
     if st.button("➡️ Submit Text Query"):
         if not faq_questions:
-            st.error("⚠ FAQ data not loaded. Please check your database and reload.")
+            st.error("⚠ FAQ data not loaded. Please check your database.")
         elif text_query.strip():
             with st.spinner("Processing your text query..."):
                 response = search_answer(text_query)
